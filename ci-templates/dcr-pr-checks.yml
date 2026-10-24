@@ -1,0 +1,52 @@
+name: dcr-pr-checks
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+jobs:
+  policy-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { repository: sandisk/dcr-platform, ref: v1, path: platform }   # pinned executor + policy
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Only change folders may be modified
+        run: |
+          changed=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          if echo "$changed" | grep -v '^changes/'; then echo "::error::only changes/** may be modified"; exit 1; fi
+      - name: Lint + policy + checksum + preview + secret scan
+        run: |
+          python platform/executor/list_change_dirs.py origin/${{ github.base_ref }} HEAD > dirs.txt
+          test -s dirs.txt || { echo "::error::no change folder in this PR"; exit 1; }
+          while read d; do python platform/executor/ci_gate.py lint --change-dir "$d"; done < dirs.txt
+  approval-gate:
+    needs: policy-lint
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with: { repository: sandisk/dcr-platform, ref: v1, path: platform }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install "httpx==0.27.*"
+      - name: ServiceNow approval by an independent, authorized approver
+        env:
+          SERVICENOW_INSTANCE_URL: ${{ secrets.SERVICENOW_INSTANCE_URL }}
+          SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
+          SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DCR_APPROVER_GROUPS: ${{ vars.DCR_APPROVER_GROUPS }}
+          DCR_GITHUB_LOGIN_MAP: ${{ vars.DCR_GITHUB_LOGIN_MAP }}
+        run: |
+          python platform/executor/list_change_dirs.py origin/${{ github.base_ref }} HEAD > dirs.txt
+          while read d; do
+            python platform/executor/ci_gate.py approval --change-dir "$d" --pr ${{ github.event.pull_request.number }}
+          done < dirs.txt
