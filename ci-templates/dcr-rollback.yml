@@ -1,0 +1,32 @@
+name: dcr-rollback
+# Dispatched by the DCR app after a ServiceNow-approved rollback. Safeguards are re-checked inside the job.
+on:
+  workflow_dispatch:
+    inputs:
+      change_dir: { description: "changes/<domain>/<id>/r<n>", required: true }
+      deployment_json: { description: "deployment record from the ledger (pre/post version, run id)", required: true }
+      ticket: { description: "ServiceNow ticket with the approved rollback", required: true }
+concurrency: { group: dcr-production, cancel-in-progress: false }
+permissions: { id-token: write, contents: read }
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_CLIENT_ID: ${{ secrets.DCR_DEPLOY_SP_CLIENT_ID }}
+      STAGING: /Volumes/ws_azure_classic_eastus_pedro/dcr_procurement/dcr_staging
+      DEPLOYMENT_JSON: ${{ inputs.deployment_json }}
+      CHANGE_DIR: ${{ inputs.change_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - name: Stage and run the executor in rollback mode
+        run: |
+          printf '%s' "$DEPLOYMENT_JSON" > "$CHANGE_DIR/deployment.json"
+          id=$(basename "$(dirname "$CHANGE_DIR")"); rev=$(basename "$CHANGE_DIR")
+          dest="$STAGING/$id/$rev/rollback-$GITHUB_RUN_ID"
+          databricks fs cp -r "$CHANGE_DIR" "dbfs:$dest" --overwrite
+          databricks jobs run-now ${{ secrets.DCR_EXECUTOR_JOB_ID }} \
+            --json "{\"job_parameters\": {\"mode\": \"rollback\", \"change_dir\": \"$dest\", \"commit_sha\": \"$GITHUB_SHA\"}}"
