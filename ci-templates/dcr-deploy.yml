@@ -1,0 +1,50 @@
+name: dcr-deploy
+on:
+  push:
+    branches: [main]
+    paths: ["changes/**"]
+concurrency: { group: dcr-production, cancel-in-progress: false }   # one production write at a time
+permissions:
+  id-token: write      # GitHub OIDC → Databricks workload identity federation (no stored Databricks secret)
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_CLIENT_ID: ${{ secrets.DCR_DEPLOY_SP_CLIENT_ID }}
+      STAGING: /Volumes/ws_azure_classic_eastus_pedro/dcr_procurement/dcr_staging
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - uses: actions/checkout@v4
+        with: { repository: sandisk/dcr-platform, ref: v1, path: platform }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: databricks/setup-cli@main
+      - run: pip install "httpx==0.27.*"
+      - name: Re-run lint and the approval gate on the merged commit (fail closed)
+        env:
+          SERVICENOW_INSTANCE_URL: ${{ secrets.SERVICENOW_INSTANCE_URL }}
+          SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
+          SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DCR_APPROVER_GROUPS: ${{ vars.DCR_APPROVER_GROUPS }}
+        run: |
+          python platform/executor/list_change_dirs.py HEAD~1 HEAD > dirs.txt
+          while read d; do
+            python platform/executor/ci_gate.py lint --change-dir "$d"
+            python platform/executor/ci_gate.py approval --change-dir "$d"
+          done < dirs.txt
+      - name: Stage the change folder and run the executor job (runs as the deploy SP)
+        run: |
+          while read d; do
+            id=$(basename "$(dirname "$d")"); rev=$(basename "$d")
+            dest="$STAGING/$id/$rev/${GITHUB_SHA:0:12}"
+            databricks fs cp -r "$d" "dbfs:$dest" --overwrite
+            databricks jobs run-now ${{ secrets.DCR_EXECUTOR_JOB_ID }} \
+              --json "{\"job_parameters\": {\"mode\": \"deploy\", \"change_dir\": \"$dest\", \"commit_sha\": \"$GITHUB_SHA\"}}"
+          done < dirs.txt
+      # The executor writes the ledger; the DCR app reads it and posts evidence to ServiceNow and the PR.
